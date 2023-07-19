@@ -6,6 +6,7 @@ OBJS = dm.o \
        main.o
 
 CXX = $(CROSS_COMPILE)g++
+CXXFLAGS += -std=c++17
 .SUFFIXES: .cpp.o
 
 $(TARGET): $(OBJS)
