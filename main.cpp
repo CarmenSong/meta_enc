@@ -1,148 +1,122 @@
-#include <iostream>
-#include <fstream>
-#include <iomanip>
-#include <unistd.h>
 #include <string.h>
-#include "dm.h"
+#include "aes_256_xts.h"
+#include "Options.h"
 
-#define ADD_FAILURE() std::cerr
-#define GTEST_LOG_(x) std::cout
-
-using namespace android::dm;
-
-constexpr int kAes256KeySize = 32;
-constexpr int kAes256XtsKeySize = 2 * kAes256KeySize;
+int kDirectIOAlignment = 4096;
+int kTestDataBytes = 4096;
 int kCryptoSectorSize = 4096;
-//int kTestDataSectors = 256;
-int kTestDataSectors = 4096;
-int kTestDataBytes = kTestDataSectors * kCryptoSectorSize;
-int kDmApiSectorSize = 512;
 
-std::string test_dm_device_name_;
-std::string raw_blk_device_;
-std::string dm_device_path_;
-DeviceMapper *dm_;
 
-std::string BytesToHex(const std::vector<uint8_t> &bytes) {
-  std::ostringstream o;
-  for (uint8_t b : bytes) {
-    o << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+void dump(const std::string key, const std::vector<uint8_t> data){
+  int cnt= 0;
+  std::cout << key << std::endl;
+  for(const uint8_t byte : data){
+    if(cnt%16 == 0) {
+      std::cout << std::endl;
+      std::cout << " 0x" << std::setw(5) << std::setfill('0') << cnt/16 << "0  ";
+    }
+    std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte) << " "; 
+    cnt++;
   }
-  return o.str();
+  std::cout << std::endl;
 }
 
-void RandomBytesForTesting(std::vector<uint8_t> &bytes) {
-  for (size_t i = 0; i < bytes.size(); i++) {
-    bytes[i] = rand();
-  }
-}
+bool ReadBlockDevice(const std::string &blk_device, size_t count,
+                            std::vector<uint8_t> *data) {
+  std::cout << "Reading " << count << " bytes from " << blk_device << std::endl;
+  std::unique_ptr<void, void (*)(void *)> buf_mem(
+      malloc(count), free);
 
-std::vector<uint8_t> GenerateTestKey(size_t size) {
-  std::vector<uint8_t> key(size);
-  RandomBytesForTesting(key);
-  return key;
-}
-
-void SetUp() {
-  dm_ = &DeviceMapper::Instance();
-
-  test_dm_device_name_ = 
-     "DmDefaultKeyTest";
-
-  if(raw_blk_device_.empty()){
-    std::cout << "Use /dev/sdb1 for block device because block device is not input." << std::endl;
-    raw_blk_device_ = "/dev/sdb1";
-  }
-
-  dm_->DeleteDeviceIfExists(test_dm_device_name_.c_str());
-}
-
-// Creates the test dm-default-key mapping using the given key and settings.
-// If the dm device creation fails, then it is assumed the kernel doesn't
-// support the given encryption settings, and a failure is not added.
-bool CreateTestDevice(const std::string &cipher,
-                                        const std::vector<uint8_t> &key,
-                                        bool is_wrapped_key) {
-//  static_assert(kTestDataBytes % kDmApiSectorSize == 0);
-  std::unique_ptr<DmTargetDefaultKey> target =
-      std::make_unique<DmTargetDefaultKey>(0, kTestDataBytes / kDmApiSectorSize,
-                                           cipher.c_str(), BytesToHex(key),
-                                           raw_blk_device_, 0);
-  target->SetSetDun();
-  if (is_wrapped_key) target->SetWrappedKeyV0();
-
-  DmTable table;
-  if (!table.AddTarget(std::move(target))) {
-    ADD_FAILURE() << "Failed to add default-key target to table";
+  if (buf_mem == nullptr) {
+    std::cerr << "out of memory" << std::endl;
     return false;
   }
-  if (!table.valid()) {
-    ADD_FAILURE() << "Device-mapper table failed to validate";
+  uint8_t *buffer = static_cast<uint8_t *>(buf_mem.get());
+
+  FILE *fd = 
+      fopen(blk_device.c_str(), "r");
+  if (fd < 0) {
+    std::cerr << "Failed to open " << blk_device << std::endl;
     return false;
   }
-  if (!dm_->CreateDevice(test_dm_device_name_, table, &dm_device_path_,
-                         std::chrono::seconds(0))) {
-    GTEST_LOG_(INFO) << "Unable to create default-key mapping" << " <errono>  "
-                     << ".  Assuming that the encryption settings cipher=\""
-                     << cipher << "\", is_wrapped_key=" << is_wrapped_key
-                     << " are unsupported and skipping the test.";
-    return false;
+  for(int i=0; i < (count-1)/kDirectIOAlignment + 1; i++){
+    int rsize = fread(buffer + i * kDirectIOAlignment, 1, kDirectIOAlignment, fd);
+    if(rsize > 0){
+      if( rsize != kDirectIOAlignment) {
+        //std::cerr << "read size is "<< rsize << ". Info: count is not align " << kDirectIOAlignment << std::endl;
+      }
+    }else{
+      std::cerr << "Read failed";
+      return false;
+    }
   }
-  GTEST_LOG_(INFO) << "Created default-key mapping at " << dm_device_path_
-                   << " using cipher=\"" << cipher
-                   << "\", key=" << BytesToHex(key)
-                   << ", is_wrapped_key=" << is_wrapped_key;
+
+  *data = std::vector<uint8_t>(buffer, buffer + count);
+  fclose(fd);
   return true;
 }
 
+std::string raw_blk_device_ = "raw.dat";
+std::string dm_device_path_ = "dec.dat";
+std::string key_file = "key.dat";
+enum class Mode { UNKNOWN, ENCRYPT, DECRYPT };
+int main(int argc, char** argv){
+  Aes256XtsCipher cipher;
+  Mode mode = Mode::UNKNOWN;
 
-
-int main(int argc, char *argv[]){
+  std::vector<uint8_t> decrypted_data;
   std::vector<uint8_t> key;
-  int opt;
-  opterr = 0;
-  while((opt = getopt(argc, argv, "d:k:")) != -1){
-    switch(opt){
-      case 'd':
-        {
-          raw_blk_device_ = std::string(optarg);;
-          break;
-        }
-      case 'k':
-        {
-          std::ifstream fin( optarg, std::ios::in | std::ios::binary );
-          if(!fin){
-            std::cout << "cannot open " << optarg << std::endl;
-            return 1;
-          }
-          key = std::vector<uint8_t>((std::istreambuf_iterator<char>(fin)), (std::istreambuf_iterator<char>()));
-          if(key.size() != kAes256XtsKeySize){
-            std::cout << "input key needs 64byte. but your key is " << key.size() << "byte." << std::endl;
-            key = std::vector<uint8_t>();
-          }
-          break;
-        }
-      default:
-        std::cout << "Usage: " << argv[0] << " [-d raw_blk_device] [-k key]" << std::endl;
-        return 0;
+
+  // Parse Args
+  Option opts(argc, argv);
+
+  if(opts.GetArg("r") != ""){
+    mode = Mode::DECRYPT;
+  }else if(opts.GetArg("d") != ""){
+    mode = Mode::ENCRYPT;
+  }
+   
+  kTestDataBytes = stoi(opts.GetArg("l","4096"));
+  int sector = strtol(opts.GetArg("s", "0").c_str(), NULL , 0);
+  std::cout << "Start Sector is " << sector << std::endl;
+  //opts.GetArg("o", "");
+
+  ReadBlockDevice(opts.GetArg("k"), cipher.keysize(), &key);
+  //dump("key.dat", key);
+
+  uint64_t* iv = (uint64_t*)malloc(cipher.ivsize());
+  memset(iv, 0, cipher.ivsize());
+  *iv = ((uint64_t)sector);
+
+  if(mode == Mode::DECRYPT){
+    std::vector<uint8_t> raw_data;
+    std::vector<uint8_t> decrypted_data(kTestDataBytes);
+    ReadBlockDevice(opts.GetArg("r"), kTestDataBytes, &raw_data);
+    //dump("raw data", raw_data);
+
+    for (size_t i = 0; i < kTestDataBytes; i += kCryptoSectorSize) {
+      cipher.Decrypt(key, reinterpret_cast<const uint8_t *>(iv),
+                               &raw_data[i], &decrypted_data[i],
+                               kCryptoSectorSize);
+      // Update the IV by incrementing the crypto sector number.
+      *iv = ((uint64_t)(*iv) + 1);
     }
+    
+    dump("decrypt data", decrypted_data);
+  }else if(mode == Mode::ENCRYPT){
+    std::vector<uint8_t> decrypted_data;
+    std::vector<uint8_t> encrypted_data(kTestDataBytes);
+    ReadBlockDevice(opts.GetArg("d"), kTestDataBytes, &decrypted_data);
+    //dump("decrypted data", decrypted_data);
+
+    for (size_t i = 0; i < kTestDataBytes; i += kCryptoSectorSize) {
+      cipher.Encrypt(key, reinterpret_cast<const uint8_t *>(iv),
+                               &decrypted_data[i], &encrypted_data[i],
+                               kCryptoSectorSize);
+      // Update the IV by incrementing the crypto sector number.
+      *iv = ((uint64_t)(*iv) + 1);
+    }
+
+    dump("Estimated enc data", encrypted_data);
   }
-  SetUp();
-
-  if(key.empty()){
-    std::cout << "Use random key because correct length key is not input." << std::endl;
-    key = GenerateTestKey(kAes256XtsKeySize);
-    std::string key_string = std::string(key.begin(), key.end());
-    std::cout << key_string << std::endl;
-  }
-
-  if(!CreateTestDevice("aes-xts-plain64", key, false)) {
-    std::cerr << "CreateTestDevice Failed";
-    return -1;
-  }
-
-  std::cout << "CreatedTestDevice" ;
-
-  return 0;
-
 }
